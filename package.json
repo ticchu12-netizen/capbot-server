@@ -10,8 +10,11 @@
     "node": "20"
   },
   "dependencies": {
+    "@solana/web3.js": "^1.98.4",
+    "dotenv": "^16.4.5",
     "firebase-admin": "^12.6.0",
     "node-cron": "^3.0.3",
-    "dotenv": "^16.4.5"
+    "onnxruntime-node": "^1.25.1",
+    "tweetnacl": "^1.0.3"
   }
 }

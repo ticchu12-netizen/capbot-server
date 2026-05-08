@@ -3,3 +3,13 @@ serviceAccount.json
 .env
 *.log
 .DS_Store*.Identifier
+
+# Private key — NEVER commit
+upgradeAuthority.json
+
+# Brain weights — kept server-side per iNFT architecture
+brain/
+
+# Windows zone metadata
+*.Identifier
+serviceAccount.Identifier
