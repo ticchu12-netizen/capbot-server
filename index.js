@@ -132,8 +132,21 @@ async function upgradeBrainOnChain(uid, winnings, battleId) {
     if (tier < 0 || tier >= TIER_CEILINGS.length) return;
     if (!player.solanaWalletAddress || !player.stakedAssetId) return;
 
-    const currentBrainSteps = player.stakedBrainSteps ?? 0;
-    const ceiling = TIER_CEILINGS[tier];
+    // Read authoritative brain_steps from on-chain StakeRecord (Firestore mirror can lag)
+const ownerPubkey = new PublicKey(player.solanaWalletAddress);
+const assetIdPubkey = new PublicKey(player.stakedAssetId);
+const [stakeRecord] = PublicKey.findProgramAddressSync(
+    [Buffer.from("stake_record"), ownerPubkey.toBuffer(), assetIdPubkey.toBuffer()],
+    STAKING_PROGRAM_ID
+);
+const stakeRecordAccount = await connection.getAccountInfo(stakeRecord);
+if (!stakeRecordAccount) {
+    console.log(`[Capbot] 🧠 ${uid.slice(0,6)}.. no on-chain stake record (unstaked?)`);
+    return;
+}
+// Parse brain_steps from StakeRecord byte layout: offset 73, u32 LE
+const currentBrainSteps = stakeRecordAccount.data.readUInt32LE(73);
+const ceiling = TIER_CEILINGS[tier];
     if (currentBrainSteps >= ceiling) {
         console.log(`[Capbot] 🧠 ${uid.slice(0,6)}.. brain at ceiling (${currentBrainSteps})`);
         return;
@@ -159,8 +172,6 @@ async function upgradeBrainOnChain(uid, winnings, battleId) {
         return;
     }
 
-    const ownerPubkey = new PublicKey(player.solanaWalletAddress);
-    const assetIdPubkey = new PublicKey(player.stakedAssetId);
     const timestamp = BigInt(Date.now());
 
     // Build message: PREFIX || asset_id (32) || new_brain_steps (u32 LE) || timestamp (i64 LE)
@@ -184,10 +195,6 @@ async function upgradeBrainOnChain(uid, winnings, battleId) {
         signature: signature,
     });
 
-    const [stakeRecord] = PublicKey.findProgramAddressSync(
-        [Buffer.from("stake_record"), ownerPubkey.toBuffer(), assetIdPubkey.toBuffer()],
-        STAKING_PROGRAM_ID
-    );
     const [programConfig] = PublicKey.findProgramAddressSync(
         [Buffer.from("program_config")],
         STAKING_PROGRAM_ID
