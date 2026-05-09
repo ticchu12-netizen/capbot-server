@@ -347,12 +347,15 @@ async function runBattleForPlayer(playerDoc) {
     const aiType = pickOpponentType(capbotType);
     const multiplier = CONFIG.TIER_MULTIPLIERS[stakedTier];
     let playerWon;
-    try {
-        playerWon = await runBattle(capbotType, aiType);
-    } catch (err) {
-        console.error('[Capbot] battle sim error, defaulting to loss:', err.message);
-        playerWon = false;
-    }
+let turnLog = [];
+try {
+    const battleResult = await runBattle(capbotType, aiType);
+    playerWon = battleResult.result;
+    turnLog = battleResult.turnLog || [];
+} catch (err) {
+    console.error('[Capbot] battle sim error, defaulting to loss:', err.message);
+    playerWon = false;
+}
     const winnings = Math.floor(CONFIG.BASE_BET * multiplier);
 
     const idempotencyKey = `capbot_${uid}_${Date.now()}_${randomUUID().slice(0, 8)}`;
@@ -427,6 +430,23 @@ async function runBattleForPlayer(playerDoc) {
             `(${multiplier}×)`
         );
 
+        try {
+            await db.collection('battle_replays').doc(activityRef.id).set({
+                battleId: activityRef.id,
+                uid,
+                walletAddress: player.solanaWalletAddress ?? null,
+                capbotName: capbotType,
+                capbotTier: stakedTier,
+                opponentName: aiType,
+                result: playerWon ? 'win' : 'lose',
+                turns: turnLog,
+                capCoinDelta: playerWon ? winnings : -CONFIG.BASE_BET,
+                multiplier,
+                timestamp: Date.now(),
+            });
+        } catch (err) {
+            console.warn(`[Capbot] failed to save replay for ${uid.slice(0,6)}..:`, err.message);
+        }
         // Pattern 2: bump on-chain brain_steps after a successful battle
         await upgradeBrainOnChain(uid);
     } catch (err) {

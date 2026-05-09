@@ -381,7 +381,7 @@ async function chooseMove(brain, self, opp) {
 
     let bestMove = mctsPlanning(brain, self, opp, probs);
 
-    // ---- Hard-coded override rules (applied AFTER MCTS, mirror C# order) ----
+    
     const oppHpNorm = opp.currentHP / opp.maxHP;
     const debuffPct = opp.defenseDebuffPercentage;
     const typeAdv   = getTypeEffectiveness(self.type, opp.type) - getTypeEffectiveness(opp.type, self.type);
@@ -396,26 +396,26 @@ async function chooseMove(brain, self, opp) {
             brain.hasUsedUlt = true;
         }
     }
-    // Rule 1: save ult for finishing blow
+    
     else if (isMoveUsable(self, 3) && oppHpNorm <= 0.30 && debuffPct >= 40) {
         bestMove = 3;
     }
-    // Rule 2: force Intimidate stacking when type-disadvantaged
+    
     else if (typeAdv < 0 && debuffPct < 55) {
         bestMove = 2;
     }
-    // Rule 3: stop intimidating, swing for KO
+    
     else if (debuffPct >= 55) {
         const estDmg = simulateDamage(self, opp, self.moves[1], false);
         if (estDmg >= opp.currentHP) bestMove = 1;
     }
-    // Rule 4: prefer type-advantage move over neutral Headbutt
+    
     else {
         const typeEff = getTypeEffectiveness(self.moves[1].type, opp.type);
         if (typeEff > 1) bestMove = 1;
     }
 
-    // Final safety: if override picked something unusable (e.g. ult after spent), fall back
+    
     if (!isMoveUsable(self, bestMove)) bestMove = validMoves[0];
 
     return bestMove;
@@ -428,10 +428,12 @@ async function executeMove(actor, target, moveIdx) {
     const move = actor.moves[moveIdx];
     actor.lastUsedMove = move;
     if (move.pp > 0) move.pp--;
-
     if (move.power > 0) {
-        const { damage } = calculateDamage(actor, target, move);
+        const { damage, isCritical } = calculateDamage(actor, target, move);
+        actor.lastWasCrit = isCritical;
         applyDamage(target, damage);
+    } else {
+        actor.lastWasCrit = false;
     }
     applyMoveEffect(actor, target, move);
 }
@@ -441,31 +443,54 @@ async function runBattle(capbotName, opponentName) {
     const opponent = createCharacter(nameToType(opponentName));
     const capbotBrain   = createAiBrain();
     const opponentBrain = createAiBrain();
-
     const MAX_ROUNDS = 50;
+    const turnLog = [];
+    let result = null;
 
+    outer:
     for (let round = 0; round < MAX_ROUNDS; round++) {
-        // Speed determines order. Capbot wins ties (arbitrary, doesn't really matter).
         const capbotFirst = capbot.speed >= opponent.speed;
         const order = capbotFirst
-            ? [{ a: capbot,   t: opponent, b: capbotBrain   },
-               { a: opponent, t: capbot,   b: opponentBrain }]
-            : [{ a: opponent, t: capbot,   b: opponentBrain },
-               { a: capbot,   t: opponent, b: capbotBrain   }];
-
-        for (const { a, t, b } of order) {
+            ? [{ a: capbot,   t: opponent, b: capbotBrain,   isCapbot: true  },
+               { a: opponent, t: capbot,   b: opponentBrain, isCapbot: false }]
+            : [{ a: opponent, t: capbot,   b: opponentBrain, isCapbot: false },
+               { a: capbot,   t: opponent, b: capbotBrain,   isCapbot: true  }];
+        for (const { a, t, b, isCapbot } of order) {
             if (a.isDefeated || t.isDefeated) continue;
             const moveIdx = await chooseMove(b, a, t);
-            await executeMove(a, t, moveIdx);
-            if (t.isDefeated) return a === capbot;
-        }
 
+            // Snapshot before executeMove
+            const tHpBefore = t.currentHP;
+            const tIntimidateBefore = t.intimidateStacks || 0;
+
+            await executeMove(a, t, moveIdx);
+
+            // Record this turn
+            turnLog.push({
+                round: round + 1,
+                attacker: isCapbot ? 'capbot' : 'opponent',
+                moveIdx,
+                moveName: (a.moves && a.moves[moveIdx] && a.moves[moveIdx].name) || `move_${moveIdx}`,
+                damageDealt: Math.max(0, tHpBefore - t.currentHP),
+                isCrit: a.lastWasCrit === true,
+                capbotHp: capbot.currentHP,
+                capbotMaxHp: capbot.maxHP,
+                opponentHp: opponent.currentHP,
+                opponentMaxHp: opponent.maxHP,
+                intimidateApplied: (t.intimidateStacks || 0) - tIntimidateBefore,
+                targetIntimidateTotal: t.intimidateStacks || 0,
+            });
+
+            if (t.isDefeated) { result = (a === capbot); break outer; }
+        }
         applyPassive(capbot);
         applyPassive(opponent);
     }
 
-    // Timeout: HP fraction tiebreak; tie → capbot loses (conservative)
-    return (capbot.currentHP / capbot.maxHP) > (opponent.currentHP / opponent.maxHP);
+    if (result === null) {
+        result = (capbot.currentHP / capbot.maxHP) > (opponent.currentHP / opponent.maxHP);
+    }
+    return { result, turnLog };
 }
 
 module.exports = { runBattle, TYPE, TYPE_NAME };
