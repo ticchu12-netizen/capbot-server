@@ -60,16 +60,27 @@ const TIER_CEILINGS = [14_000_000, 39_000_000, 54_000_000, 60_000_000];
 const connection = new Connection(HELIUS_RPC, "confirmed");
 
 let upgradeAuthorityKey;
-try {
-    upgradeAuthorityKey = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(
-        fs.readFileSync('./upgradeAuthority.json', 'utf-8')
-    )));
-    console.log('[Capbot] Upgrade authority:', upgradeAuthorityKey.publicKey.toBase58());
-} catch (e) {
-    console.error('[Capbot] FATAL: upgradeAuthority.json not found in capbot-server/.');
-    process.exit(1);
+if (process.env.UPGRADE_AUTHORITY_JSON) {
+    try {
+        const parsed = JSON.parse(process.env.UPGRADE_AUTHORITY_JSON);
+        upgradeAuthorityKey = Keypair.fromSecretKey(Uint8Array.from(parsed));
+        console.log('[Capbot] Using UPGRADE_AUTHORITY_JSON env var');
+    } catch (e) {
+        console.error('[Capbot] FATAL: failed to parse UPGRADE_AUTHORITY_JSON env var:', e.message);
+        process.exit(1);
+    }
+} else {
+    try {
+        upgradeAuthorityKey = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(
+            fs.readFileSync('./upgradeAuthority.json', 'utf-8')
+        )));
+        console.log('[Capbot] Using local upgradeAuthority.json');
+    } catch (e) {
+        console.error('[Capbot] FATAL: upgradeAuthority.json not found.');
+        process.exit(1);
+    }
 }
-
+console.log('[Capbot] Upgrade authority:', upgradeAuthorityKey.publicKey.toBase58());
 // ============================================================
 // CONFIG
 // ============================================================
