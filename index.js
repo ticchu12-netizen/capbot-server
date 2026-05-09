@@ -144,8 +144,16 @@ if (!stakeRecordAccount) {
     console.log(`[Capbot] 🧠 ${uid.slice(0,6)}.. no on-chain stake record (unstaked?)`);
     return;
 }
-// Parse brain_steps from StakeRecord byte layout: offset 73, u32 LE
+// Read authoritative tier + brain_steps from on-chain StakeRecord (Firestore can lag)
+// Layout: tier at offset 72 (u8), brain_steps at offset 73 (u32 LE)
+const onChainTier = stakeRecordAccount.data[72];
 const currentBrainSteps = stakeRecordAccount.data.readUInt32LE(73);
+
+// If Firestore tier diverges from on-chain, log + skip — let discovery cron resync
+if (onChainTier !== tier) {
+    console.warn(`[Capbot] 🧠 ${uid.slice(0,6)}.. tier mismatch (chain=${onChainTier}, firestore=${tier}) — skipping upgrade`);
+    return;
+}
 const ceiling = TIER_CEILINGS[tier];
     if (currentBrainSteps >= ceiling) {
         console.log(`[Capbot] 🧠 ${uid.slice(0,6)}.. brain at ceiling (${currentBrainSteps})`);
