@@ -231,6 +231,7 @@ if (newBrainSteps <= currentBrainSteps) return;
         ],
         data: args,
     });
+console.log(`[DEBUG] ${uid.slice(0,6)}.. tier=${tier} onChainTier=${onChainTier} currentBrainSteps=${currentBrainSteps} newBrainSteps=${newBrainSteps} tierFloor=${tierFloor} ceiling=${ceiling}`);
 
     const tx = new Transaction().add(ed25519Ix).add(upgradeIx);
 
