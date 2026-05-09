@@ -89,7 +89,7 @@ const CONFIG = {
     BASE_BET: parseInt(process.env.BASE_BET || '5000', 10),
     CRON_SCHEDULE: process.env.CRON_SCHEDULE || '*/1 * * * *',
     BRAIN_UPGRADE_BURN_PCT: parseFloat(process.env.BRAIN_UPGRADE_BURN_PCT) || 0.5,
-
+BRAIN_STEPS_PER_UPGRADE: parseInt(process.env.BRAIN_STEPS_PER_UPGRADE || '500000', 10),
     TIER_MULTIPLIERS: [1.0, 1.4, 1.9, 2.8],
     TIER_TYPES: ['Healspike', 'Tsunami', 'Rageblaze', 'Rageblaze'],
 
