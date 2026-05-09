@@ -87,7 +87,7 @@ console.log('[Capbot] Upgrade authority:', upgradeAuthorityKey.publicKey.toBase5
 const CONFIG = {
     BASE_BET: parseInt(process.env.BASE_BET || '5000', 10),
     CRON_SCHEDULE: process.env.CRON_SCHEDULE || '*/1 * * * *',
-    BRAIN_STEPS_PER_UPGRADE: parseInt(process.env.BRAIN_STEPS_PER_UPGRADE || '500000', 10),
+    BRAIN_UPGRADE_BURN_PCT: parseFloat(process.env.BRAIN_UPGRADE_BURN_PCT) || 0.5,
 
     TIER_MULTIPLIERS: [1.0, 1.4, 1.9, 2.8],
     TIER_TYPES: ['Healspike', 'Tsunami', 'Rageblaze', 'Rageblaze'],
@@ -122,7 +122,7 @@ function pickOpponentType(capbotType) {
 // ============================================================
 // PATTERN 2 — Ed25519 signed brain upgrade on Solana
 // ============================================================
-async function upgradeBrainOnChain(uid) {
+async function upgradeBrainOnChain(uid, winnings, battleId) {
     // Fetch latest player state — stakedBrainSteps may have grown in a prior tick
     const playerSnap = await db.collection('players').doc(uid).get();
     if (!playerSnap.exists) return;
@@ -140,9 +140,24 @@ async function upgradeBrainOnChain(uid) {
     }
 
     const newBrainSteps = Math.min(currentBrainSteps + CONFIG.BRAIN_STEPS_PER_UPGRADE, ceiling);
-
-    // Must be > current to satisfy on-chain monotonic check
     if (newBrainSteps <= currentBrainSteps) return;
+
+    // === PROOF-OF-BURN: deduct half the winnings to fund the brain upgrade ===
+    // The Ed25519 attestation only fires after the player has paid for it.
+    // Burn currency is the starter coin matching the staked Capbot's type.
+    const capbotType = CONFIG.TIER_TYPES[tier];
+    const balanceField = `${capbotType.toLowerCase()}Coins`;
+    const currentBalance = player[balanceField] ?? 0;
+    const burnCost = Math.floor((winnings || 0) * CONFIG.BRAIN_UPGRADE_BURN_PCT);
+
+    if (burnCost <= 0) {
+        console.log(`[Capbot] 🧠 ${uid.slice(0,6)}.. upgrade skipped — zero burn cost`);
+        return;
+    }
+    if (currentBalance < burnCost) {
+        console.log(`[Capbot] 🧠 ${uid.slice(0,6)}.. upgrade skipped — insufficient ${capbotType} (have ${currentBalance}, need ${burnCost})`);
+        return;
+    }
 
     const ownerPubkey = new PublicKey(player.solanaWalletAddress);
     const assetIdPubkey = new PublicKey(player.stakedAssetId);
@@ -161,17 +176,14 @@ async function upgradeBrainOnChain(uid) {
         timestampBuf,
     ]);
 
-    // Sign with upgrade authority hot key
     const signature = nacl.sign.detached(messageBuffer, upgradeAuthorityKey.secretKey);
 
-    // Ix 0: Ed25519 sigverify (must be first)
     const ed25519Ix = Ed25519Program.createInstructionWithPublicKey({
         publicKey: upgradeAuthorityKey.publicKey.toBytes(),
         message: messageBuffer,
         signature: signature,
     });
 
-    // Ix 1: upgrade_brain_v2 (introspects ix 0)
     const [stakeRecord] = PublicKey.findProgramAddressSync(
         [Buffer.from("stake_record"), ownerPubkey.toBuffer(), assetIdPubkey.toBuffer()],
         STAKING_PROGRAM_ID
@@ -190,7 +202,7 @@ async function upgradeBrainOnChain(uid) {
     const upgradeIx = new TransactionInstruction({
         programId: STAKING_PROGRAM_ID,
         keys: [
-            { pubkey: upgradeAuthorityKey.publicKey, isSigner: true, isWritable: true }, // payer
+            { pubkey: upgradeAuthorityKey.publicKey, isSigner: true, isWritable: true },
             { pubkey: programConfig, isSigner: false, isWritable: false },
             { pubkey: ownerPubkey, isSigner: false, isWritable: false },
             { pubkey: assetIdPubkey, isSigner: false, isWritable: false },
@@ -203,10 +215,17 @@ async function upgradeBrainOnChain(uid) {
     const tx = new Transaction().add(ed25519Ix).add(upgradeIx);
 
     try {
+        // Send the on-chain attestation FIRST. If this fails, no coins burned.
         const sig = await sendAndConfirmTransaction(connection, tx, [upgradeAuthorityKey]);
-        console.log(`[Capbot] 🧠 ${uid.slice(0,6)}.. brain ${currentBrainSteps} -> ${newBrainSteps} | tx: ${sig.slice(0,16)}..`);
+        console.log(`[Capbot] 🧠 ${uid.slice(0,6)}.. brain ${currentBrainSteps} -> ${newBrainSteps} (burned ${burnCost} ${capbotType}) | tx: ${sig.slice(0,16)}..`);
 
-        await db.collection('players').doc(uid).update({ stakedBrainSteps: newBrainSteps });
+        // Then atomically: bump on-chain brain_steps mirror + deduct burn cost
+        await db.collection('players').doc(uid).update({
+            stakedBrainSteps: newBrainSteps,
+            [balanceField]: admin.firestore.FieldValue.increment(-burnCost),
+        });
+
+        // Record the burn alongside the upgrade for /proof + Unity My Capbots tab
         await db.collection('brain_upgrades').add({
             uid,
             walletAddress: player.solanaWalletAddress,
@@ -216,6 +235,9 @@ async function upgradeBrainOnChain(uid) {
             tier,
             txSignature: sig,
             timestamp: Date.now(),
+            coinsBurned: burnCost,
+            burnCurrency: capbotType,
+            battleId: battleId || null,
         });
     } catch (err) {
         console.warn(`[Capbot] 🧠 brain upgrade failed for ${uid.slice(0,6)}..:`, err.message);
@@ -447,8 +469,11 @@ try {
         } catch (err) {
             console.warn(`[Capbot] failed to save replay for ${uid.slice(0,6)}..:`, err.message);
         }
-        // Pattern 2: bump on-chain brain_steps after a successful battle
-        await upgradeBrainOnChain(uid);
+        // Pattern 2: brain upgrades only fire on wins, with proof-of-burn deduction.
+        // Pass activityRef.id for cross-doc linkage (brain_upgrades -> battle_replays).
+        if (playerWon) {
+            await upgradeBrainOnChain(uid, winnings, activityRef.id);
+        }
     } catch (err) {
         console.warn(`[Capbot] battle failed for ${uid.slice(0,6)}..: ${err.message}`);
     }
