@@ -56,6 +56,7 @@ const STAKE_BRAIN_STEPS_OFFSET = 73;
 // Tier ceilings — mirror constants.rs in the Anchor program. brain_steps grows
 // monotonically up to the ceiling for the locked tier; never overflows.
 const TIER_CEILINGS = [14_000_000, 39_000_000, 54_000_000, 60_000_000];
+const TIER_FLOORS = [0, 15_000_000, 40_000_000, 55_000_000];
 
 const connection = new Connection(HELIUS_RPC, "confirmed");
 
@@ -160,8 +161,12 @@ const ceiling = TIER_CEILINGS[tier];
         return;
     }
 
-    const newBrainSteps = Math.min(currentBrainSteps + CONFIG.BRAIN_STEPS_PER_UPGRADE, ceiling);
-    if (newBrainSteps <= currentBrainSteps) return;
+    const tierFloor = TIER_FLOORS[tier];
+let newBrainSteps = Math.min(currentBrainSteps + CONFIG.BRAIN_STEPS_PER_UPGRADE, ceiling);
+// On-chain bug workaround: stake instruction initializes brain_steps to 0 regardless
+// of tier. For tier 1+ stakes, jump to the tier floor first to satisfy the range check.
+if (newBrainSteps < tierFloor) newBrainSteps = tierFloor;
+if (newBrainSteps <= currentBrainSteps) return;
 
     // === PROOF-OF-BURN: deduct half the winnings to fund the brain upgrade ===
     // The Ed25519 attestation only fires after the player has paid for it.
