@@ -457,6 +457,7 @@ try {
             });
 
             tx.set(activityRef, {
+                battleId: activityRef.id,
                 uid,
                 walletAddress: data.solanaWalletAddress ?? null,
                 stakedAssetId: data.stakedAssetId ?? null,
