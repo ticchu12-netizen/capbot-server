@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.32.1",
+    "@phala/dstack-sdk": "^0.5.7",
     "@solana/web3.js": "^1.98.4",
     "dotenv": "^16.4.5",
     "firebase-admin": "^12.6.0",

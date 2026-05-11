@@ -1,0 +1,15 @@
+services:
+  capbot:
+    image: capmonworld/capbot-server:phase2
+    container_name: capbot
+    restart: unless-stopped
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    environment:
+      - NODE_ENV=production
+      - SOLANA_RPC_URL=${SOLANA_RPC_URL}
+      - ANCHOR_PROGRAM_ID=${ANCHOR_PROGRAM_ID}
+      - MERKLE_TREE_ADDRESS=${MERKLE_TREE_ADDRESS}
+      - UPGRADE_AUTHORITY_SECRET=${UPGRADE_AUTHORITY_SECRET}
+      - FIREBASE_SERVICE_ACCOUNT_JSON=${FIREBASE_SERVICE_ACCOUNT_JSON}
+      - CRON_SCHEDULE=${CRON_SCHEDULE}

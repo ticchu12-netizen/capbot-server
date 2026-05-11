@@ -1,11 +1,12 @@
 /**
- * Capbot Server — Phase 2 (stub battles) + Phase 4 (Pattern 2 brain upgrades)
+ * Capbot Server — Phase 2 (stub battles) + Phase 4 (TEE-attested Pattern 2 brain upgrades)
  *
  * Each cron tick:
  *   1. Query players with stakedTier >= 0
  *   2. For each: stub battle (always-win) — credits Cap Coins via Admin SDK txn
- *   3. If brain_steps < tier ceiling: sign Ed25519 message, submit upgrade_brain_v2 tx
- *      so the on-chain stake_record.brain_steps actually grows. This is the iNFT pitch.
+ *   3. If brain_steps < tier ceiling: sign Ed25519 message with TEE-derived key,
+ *      generate TDX attestation quote, submit upgrade_brain_v2 tx so the on-chain
+ *      stake_record.brain_steps actually grows. Quote stored in Firestore.
  */
 
 require('dotenv').config();
@@ -19,9 +20,11 @@ const {
 } = require('@solana/web3.js');
 const nacl = require('tweetnacl');
 const fs = require('fs');
+const { DstackClient } = require('@phala/dstack-sdk');
+const { toKeypairSecure } = require('@phala/dstack-sdk/solana');
 
 // ============================================================
-// FIREBASE INIT — local file OR env var (Railway)
+// FIREBASE INIT — local file OR env var (Railway / Phala)
 // ============================================================
 let serviceAccount;
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
@@ -60,28 +63,49 @@ const TIER_FLOORS = [0, 15_000_000, 40_000_000, 55_000_000];
 
 const connection = new Connection(HELIUS_RPC, "confirmed");
 
+// ============================================================
+// UPGRADE AUTHORITY — TEE-derived (Phala CVM) with file fallback
+// ============================================================
 let upgradeAuthorityKey;
-if (process.env.UPGRADE_AUTHORITY_JSON) {
+let dstackClient = null;
+
+async function loadUpgradeAuthority() {
     try {
-        const parsed = JSON.parse(process.env.UPGRADE_AUTHORITY_JSON);
-        upgradeAuthorityKey = Keypair.fromSecretKey(Uint8Array.from(parsed));
-        console.log('[Capbot] Using UPGRADE_AUTHORITY_JSON env var');
-    } catch (e) {
-        console.error('[Capbot] FATAL: failed to parse UPGRADE_AUTHORITY_JSON env var:', e.message);
-        process.exit(1);
+        dstackClient = new DstackClient();
+        const info = await dstackClient.info();
+        console.log('[TEE] App ID:', info.app_id);
+        console.log('[TEE] Instance ID:', info.instance_id);
+        const keyResult = await dstackClient.getKey('capmon/upgrade-authority', 'mainnet');
+        upgradeAuthorityKey = toKeypairSecure(keyResult);
+        console.log('[TEE] Upgrade authority (TEE-derived):', upgradeAuthorityKey.publicKey.toBase58());
+        return;
+    } catch (err) {
+        console.warn('[TEE] TEE key derivation failed, falling back to file/env:', err.message);
+        dstackClient = null;
     }
-} else {
+
+    if (process.env.UPGRADE_AUTHORITY_JSON) {
+        try {
+            const parsed = JSON.parse(process.env.UPGRADE_AUTHORITY_JSON);
+            upgradeAuthorityKey = Keypair.fromSecretKey(Uint8Array.from(parsed));
+            console.log('[Capbot] Using UPGRADE_AUTHORITY_JSON env var');
+            return;
+        } catch (e) {
+            console.error('[Capbot] FATAL: failed to parse UPGRADE_AUTHORITY_JSON:', e.message);
+            process.exit(1);
+        }
+    }
     try {
         upgradeAuthorityKey = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(
             fs.readFileSync('./upgradeAuthority.json', 'utf-8')
         )));
         console.log('[Capbot] Using local upgradeAuthority.json');
     } catch (e) {
-        console.error('[Capbot] FATAL: upgradeAuthority.json not found.');
+        console.error('[Capbot] FATAL: no upgrade authority available.');
         process.exit(1);
     }
 }
-console.log('[Capbot] Upgrade authority:', upgradeAuthorityKey.publicKey.toBase58());
+
 // ============================================================
 // CONFIG
 // ============================================================
@@ -89,7 +113,7 @@ const CONFIG = {
     BASE_BET: parseInt(process.env.BASE_BET || '5000', 10),
     CRON_SCHEDULE: process.env.CRON_SCHEDULE || '*/1 * * * *',
     BRAIN_UPGRADE_BURN_PCT: parseFloat(process.env.BRAIN_UPGRADE_BURN_PCT) || 0.5,
-BRAIN_STEPS_PER_UPGRADE: parseInt(process.env.BRAIN_STEPS_PER_UPGRADE || '500000', 10),
+    BRAIN_STEPS_PER_UPGRADE: parseInt(process.env.BRAIN_STEPS_PER_UPGRADE || '500000', 10),
     TIER_MULTIPLIERS: [1.0, 1.4, 1.9, 2.8],
     TIER_TYPES: ['Healspike', 'Tsunami', 'Rageblaze', 'Rageblaze'],
 
@@ -121,7 +145,7 @@ function pickOpponentType(capbotType) {
 }
 
 // ============================================================
-// PATTERN 2 — Ed25519 signed brain upgrade on Solana
+// PATTERN 2 — TEE-attested Ed25519 brain upgrade on Solana
 // ============================================================
 async function upgradeBrainOnChain(uid, winnings, battleId) {
     // Fetch latest player state — stakedBrainSteps may have grown in a prior tick
@@ -134,39 +158,39 @@ async function upgradeBrainOnChain(uid, winnings, battleId) {
     if (!player.solanaWalletAddress || !player.stakedAssetId) return;
 
     // Read authoritative brain_steps from on-chain StakeRecord (Firestore mirror can lag)
-const ownerPubkey = new PublicKey(player.solanaWalletAddress);
-const assetIdPubkey = new PublicKey(player.stakedAssetId);
-const [stakeRecord] = PublicKey.findProgramAddressSync(
-    [Buffer.from("stake_record"), ownerPubkey.toBuffer(), assetIdPubkey.toBuffer()],
-    STAKING_PROGRAM_ID
-);
-const stakeRecordAccount = await connection.getAccountInfo(stakeRecord);
-if (!stakeRecordAccount) {
-    console.log(`[Capbot] 🧠 ${uid.slice(0,6)}.. no on-chain stake record (unstaked?)`);
-    return;
-}
-// Read authoritative tier + brain_steps from on-chain StakeRecord (Firestore can lag)
-// Layout: tier at offset 72 (u8), brain_steps at offset 73 (u32 LE)
-const onChainTier = stakeRecordAccount.data[72];
-const currentBrainSteps = stakeRecordAccount.data.readUInt32LE(73);
+    const ownerPubkey = new PublicKey(player.solanaWalletAddress);
+    const assetIdPubkey = new PublicKey(player.stakedAssetId);
+    const [stakeRecord] = PublicKey.findProgramAddressSync(
+        [Buffer.from("stake_record"), ownerPubkey.toBuffer(), assetIdPubkey.toBuffer()],
+        STAKING_PROGRAM_ID
+    );
+    const stakeRecordAccount = await connection.getAccountInfo(stakeRecord);
+    if (!stakeRecordAccount) {
+        console.log(`[Capbot] 🧠 ${uid.slice(0,6)}.. no on-chain stake record (unstaked?)`);
+        return;
+    }
+    // Read authoritative tier + brain_steps from on-chain StakeRecord (Firestore can lag)
+    // Layout: tier at offset 72 (u8), brain_steps at offset 73 (u32 LE)
+    const onChainTier = stakeRecordAccount.data[72];
+    const currentBrainSteps = stakeRecordAccount.data.readUInt32LE(73);
 
-// If Firestore tier diverges from on-chain, log + skip — let discovery cron resync
-if (onChainTier !== tier) {
-    console.warn(`[Capbot] 🧠 ${uid.slice(0,6)}.. tier mismatch (chain=${onChainTier}, firestore=${tier}) — skipping upgrade`);
-    return;
-}
-const ceiling = TIER_CEILINGS[tier];
+    // If Firestore tier diverges from on-chain, log + skip — let discovery cron resync
+    if (onChainTier !== tier) {
+        console.warn(`[Capbot] 🧠 ${uid.slice(0,6)}.. tier mismatch (chain=${onChainTier}, firestore=${tier}) — skipping upgrade`);
+        return;
+    }
+    const ceiling = TIER_CEILINGS[tier];
     if (currentBrainSteps >= ceiling) {
         console.log(`[Capbot] 🧠 ${uid.slice(0,6)}.. brain at ceiling (${currentBrainSteps})`);
         return;
     }
 
     const tierFloor = TIER_FLOORS[tier];
-let newBrainSteps = Math.min(currentBrainSteps + CONFIG.BRAIN_STEPS_PER_UPGRADE, ceiling);
-// On-chain bug workaround: stake instruction initializes brain_steps to 0 regardless
-// of tier. For tier 1+ stakes, jump to the tier floor first to satisfy the range check.
-if (newBrainSteps < tierFloor) newBrainSteps = tierFloor;
-if (newBrainSteps <= currentBrainSteps) return;
+    let newBrainSteps = Math.min(currentBrainSteps + CONFIG.BRAIN_STEPS_PER_UPGRADE, ceiling);
+    // On-chain bug workaround: stake instruction initializes brain_steps to 0 regardless
+    // of tier. For tier 1+ stakes, jump to the tier floor first to satisfy the range check.
+    if (newBrainSteps < tierFloor) newBrainSteps = tierFloor;
+    if (newBrainSteps <= currentBrainSteps) return;
 
     // === PROOF-OF-BURN: deduct half the winnings to fund the brain upgrade ===
     // The Ed25519 attestation only fires after the player has paid for it.
@@ -202,6 +226,20 @@ if (newBrainSteps <= currentBrainSteps) return;
 
     const signature = nacl.sign.detached(messageBuffer, upgradeAuthorityKey.secretKey);
 
+    // === TDX ATTESTATION QUOTE ===
+    // Proof that the Ed25519 signature was produced inside the TEE enclave.
+    // report_data = sha256(messageBuffer) — binds the quote to this specific upgrade.
+    let tdxQuote = null;
+    if (dstackClient) {
+        try {
+            const reportData = createHash('sha256').update(messageBuffer).digest();
+            const quoteResult = await dstackClient.getQuote(reportData);
+            tdxQuote = quoteResult.quote;
+        } catch (err) {
+            console.warn(`[TEE] getQuote failed for ${uid.slice(0,6)}..:`, err.message);
+        }
+    }
+
     const ed25519Ix = Ed25519Program.createInstructionWithPublicKey({
         publicKey: upgradeAuthorityKey.publicKey.toBytes(),
         message: messageBuffer,
@@ -231,14 +269,15 @@ if (newBrainSteps <= currentBrainSteps) return;
         ],
         data: args,
     });
-console.log(`[DEBUG] ${uid.slice(0,6)}.. tier=${tier} onChainTier=${onChainTier} currentBrainSteps=${currentBrainSteps} newBrainSteps=${newBrainSteps} tierFloor=${tierFloor} ceiling=${ceiling}`);
+    console.log(`[DEBUG] ${uid.slice(0,6)}.. tier=${tier} onChainTier=${onChainTier} currentBrainSteps=${currentBrainSteps} newBrainSteps=${newBrainSteps} tierFloor=${tierFloor} ceiling=${ceiling}`);
 
     const tx = new Transaction().add(ed25519Ix).add(upgradeIx);
 
     try {
         // Send the on-chain attestation FIRST. If this fails, no coins burned.
         const sig = await sendAndConfirmTransaction(connection, tx, [upgradeAuthorityKey]);
-        console.log(`[Capbot] 🧠 ${uid.slice(0,6)}.. brain ${currentBrainSteps} -> ${newBrainSteps} (burned ${burnCost} ${capbotType}) | tx: ${sig.slice(0,16)}..`);
+        const attestedTag = tdxQuote ? ' (TEE-attested)' : '';
+        console.log(`[Capbot] 🧠 ${uid.slice(0,6)}.. brain ${currentBrainSteps} -> ${newBrainSteps} (burned ${burnCost} ${capbotType})${attestedTag} | tx: ${sig.slice(0,16)}..`);
 
         // Then atomically: bump on-chain brain_steps mirror + deduct burn cost
         await db.collection('players').doc(uid).update({
@@ -259,6 +298,8 @@ console.log(`[DEBUG] ${uid.slice(0,6)}.. tier=${tier} onChainTier=${onChainTier}
             coinsBurned: burnCost,
             burnCurrency: capbotType,
             battleId: battleId || null,
+            tdxQuote,
+            teeAttested: tdxQuote !== null,
         });
     } catch (err) {
         console.warn(`[Capbot] 🧠 brain upgrade failed for ${uid.slice(0,6)}..:`, err.message);
@@ -390,15 +431,15 @@ async function runBattleForPlayer(playerDoc) {
     const aiType = pickOpponentType(capbotType);
     const multiplier = CONFIG.TIER_MULTIPLIERS[stakedTier];
     let playerWon;
-let turnLog = [];
-try {
-    const battleResult = await runBattle(capbotType, aiType);
-    playerWon = battleResult.result;
-    turnLog = battleResult.turnLog || [];
-} catch (err) {
-    console.error('[Capbot] battle sim error, defaulting to loss:', err.message);
-    playerWon = false;
-}
+    let turnLog = [];
+    try {
+        const battleResult = await runBattle(capbotType, aiType);
+        playerWon = battleResult.result;
+        turnLog = battleResult.turnLog || [];
+    } catch (err) {
+        console.error('[Capbot] battle sim error, defaulting to loss:', err.message);
+        playerWon = false;
+    }
     const winnings = Math.floor(CONFIG.BASE_BET * multiplier);
 
     const idempotencyKey = `capbot_${uid}_${Date.now()}_${randomUUID().slice(0, 8)}`;
@@ -522,11 +563,17 @@ async function tick() {
     }
 }
 
-console.log(`[Capbot] starting | cron='${CONFIG.CRON_SCHEDULE}' | base bet=${CONFIG.BASE_BET} | brain step bump=${CONFIG.BRAIN_STEPS_PER_UPGRADE}`);
-tick();
-cron.schedule(CONFIG.CRON_SCHEDULE, tick);
+// ============================================================
+// BOOT
+// ============================================================
+async function boot() {
+    await loadUpgradeAuthority();
+    console.log(`[Capbot] starting | cron='${CONFIG.CRON_SCHEDULE}' | base bet=${CONFIG.BASE_BET} | brain step bump=${CONFIG.BRAIN_STEPS_PER_UPGRADE}`);
+    tick();
+    cron.schedule(CONFIG.CRON_SCHEDULE, tick);
 
-// Run once on boot, then every 5 minutes
-console.log('[Capbot] discovery cron every 5 min');
-discoverOnChainStakers();
-cron.schedule('*/5 * * * *', discoverOnChainStakers);
+    console.log('[Capbot] discovery cron every 5 min');
+    discoverOnChainStakers();
+    cron.schedule('*/5 * * * *', discoverOnChainStakers);
+}
+boot();
