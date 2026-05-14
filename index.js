@@ -319,8 +319,8 @@ async function discoverOnChainStakers() {
             filters: [{ dataSize: STAKE_RECORD_SIZE }],
         });
 
-        // Build map: owner pubkey → highest-tier stake
-        const onChainStakers = new Map();
+        // owner → Array<{assetId, tier, brainSteps}>
+        const stakesByOwner = new Map();
         for (const acct of accounts) {
             const data = acct.account.data;
             if (data.length < STAKE_RECORD_SIZE) continue;
@@ -328,40 +328,38 @@ async function discoverOnChainStakers() {
             const assetId = new PublicKey(data.slice(STAKE_ASSET_OFFSET, STAKE_ASSET_OFFSET + 32)).toBase58();
             const tier = data[STAKE_TIER_OFFSET];
             const brainSteps = data.readUInt32LE(STAKE_BRAIN_STEPS_OFFSET);
-            const existing = onChainStakers.get(owner);
-            if (!existing || tier > existing.tier) {
-                onChainStakers.set(owner, { assetId, tier, brainSteps });
-            }
+            if (!stakesByOwner.has(owner)) stakesByOwner.set(owner, []);
+            stakesByOwner.get(owner).push({ assetId, tier, brainSteps });
         }
 
-        let registered = 0;
-        let updated = 0;
-        let cleared = 0;
+        let registered = 0, updated = 0, cleared = 0;
+        let addedStakes = 0, updatedStakes = 0, removedStakes = 0;
 
-        // Forward sync: ensure each on-chain staker has a matching Firestore doc
-        for (const [owner, stake] of onChainStakers) {
+        for (const [owner, stakes] of stakesByOwner) {
+            const top = stakes.reduce((a, b) => (b.tier > a.tier ? b : a));
             const querySnap = await db.collection('players')
                 .where('solanaWalletAddress', '==', owner)
                 .limit(1)
                 .get();
 
+            let playerRef;
             if (!querySnap.empty) {
-                // Existing doc (Twitter-linked or wallet-signed-in) — update if stake state diverges
                 const doc = querySnap.docs[0];
+                playerRef = doc.ref;
                 const existing = doc.data();
-                if (existing.stakedTier !== stake.tier ||
-                    existing.stakedAssetId !== stake.assetId ||
-                    existing.stakedBrainSteps !== stake.brainSteps) {
-                    await doc.ref.update({
-                        stakedTier: stake.tier,
-                        stakedAssetId: stake.assetId,
-                        stakedBrainSteps: stake.brainSteps,
+                if (existing.stakedTier !== top.tier ||
+                    existing.stakedAssetId !== top.assetId ||
+                    existing.stakedBrainSteps !== top.brainSteps) {
+                    await playerRef.update({
+                        stakedTier: top.tier,
+                        stakedAssetId: top.assetId,
+                        stakedBrainSteps: top.brainSteps,
                     });
                     updated++;
                 }
             } else {
-                // Wallet staked but never auth'd — create a wallet-derived player doc
-                await db.collection('players').doc(owner).set({
+                playerRef = db.collection('players').doc(owner);
+                await playerRef.set({
                     playerId: owner,
                     displayName: `Wallet ${owner.slice(0, 4)}..${owner.slice(-4)}`,
                     isGuest: false,
@@ -376,19 +374,51 @@ async function discoverOnChainStakers() {
                     rank: 0,
                     createdAt: Date.now(),
                     solanaWalletAddress: owner,
-                    stakedTier: stake.tier,
-                    stakedBrainSteps: stake.brainSteps,
-                    stakedAssetId: stake.assetId,
+                    stakedTier: top.tier,
+                    stakedBrainSteps: top.brainSteps,
+                    stakedAssetId: top.assetId,
                     walletLinkedAt: Date.now(),
                     authMethod: 'discovery',
                     discoveredAt: Date.now(),
                 });
-                console.log(`[discovery] 🎯 Registered new staker ${owner.slice(0,8)}.. tier=${stake.tier} steps=${stake.brainSteps}`);
+                console.log(`[discovery] 🎯 Registered new staker ${owner.slice(0,8)}.. (${stakes.length} stake${stakes.length>1?'s':''}, top tier=${top.tier})`);
                 registered++;
+            }
+
+            // Sync subcollection: add new, update changed, delete unstaked
+            const stakesCol = playerRef.collection('stakes');
+            const existingSnap = await stakesCol.get();
+            const existingMap = new Map();
+            existingSnap.forEach(d => existingMap.set(d.id, d.data()));
+            const onChainIds = new Set(stakes.map(s => s.assetId));
+
+            for (const s of stakes) {
+                const existing = existingMap.get(s.assetId);
+                if (!existing) {
+                    await stakesCol.doc(s.assetId).set({
+                        assetId: s.assetId,
+                        tier: s.tier,
+                        brainSteps: s.brainSteps,
+                        lastBattleAt: 0,
+                    });
+                    addedStakes++;
+                } else if (existing.tier !== s.tier || existing.brainSteps !== s.brainSteps) {
+                    await stakesCol.doc(s.assetId).update({
+                        tier: s.tier,
+                        brainSteps: s.brainSteps,
+                    });
+                    updatedStakes++;
+                }
+            }
+            for (const [id] of existingMap) {
+                if (!onChainIds.has(id)) {
+                    await stakesCol.doc(id).delete();
+                    removedStakes++;
+                }
             }
         }
 
-        // Cleanup: detect unstakes (player doc says staked, but no on-chain record)
+        // Cleanup: players marked staked in Firestore but no on-chain records
         const stakerSnap = await db.collection('players')
             .where('stakedTier', '>=', 0)
             .get();
@@ -397,7 +427,10 @@ async function discoverOnChainStakers() {
             const data = doc.data();
             const wallet = data.solanaWalletAddress;
             if (!wallet) continue;
-            if (!onChainStakers.has(wallet)) {
+            if (!stakesByOwner.has(wallet)) {
+                const stakesCol = doc.ref.collection('stakes');
+                const stakesSnap = await stakesCol.get();
+                for (const s of stakesSnap.docs) await s.ref.delete();
                 await doc.ref.update({
                     stakedTier: -1,
                     stakedBrainSteps: 0,
@@ -408,7 +441,7 @@ async function discoverOnChainStakers() {
             }
         }
 
-        console.log(`[discovery] ${onChainStakers.size} on-chain stakers | registered=${registered} updated=${updated} cleared=${cleared} | ${Date.now() - start}ms`);
+        console.log(`[discovery] ${stakesByOwner.size} owners | players: reg=${registered} upd=${updated} clr=${cleared} | stakes: +${addedStakes} ~${updatedStakes} -${removedStakes} | ${Date.now() - start}ms`);
     } catch (err) {
         console.error('[discovery] error:', err);
     }
