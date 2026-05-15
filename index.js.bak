@@ -147,70 +147,97 @@ function pickOpponentType(capbotType) {
 // ============================================================
 // PATTERN 2 — TEE-attested Ed25519 brain upgrade on Solana
 // ============================================================
-async function upgradeBrainOnChain(uid, assetId, tier, winnings, battleId) {
+async function upgradeBrainOnChain(uid, winnings, battleId) {
+    // Fetch latest player state — stakedBrainSteps may have grown in a prior tick
     const playerSnap = await db.collection('players').doc(uid).get();
     if (!playerSnap.exists) return;
     const player = playerSnap.data();
 
+    const tier = player.stakedTier;
     if (tier < 0 || tier >= TIER_CEILINGS.length) return;
-    if (!player.solanaWalletAddress) return;
+    if (!player.solanaWalletAddress || !player.stakedAssetId) return;
 
+    // Read authoritative brain_steps from on-chain StakeRecord (Firestore mirror can lag)
     const ownerPubkey = new PublicKey(player.solanaWalletAddress);
-    const assetIdPubkey = new PublicKey(assetId);
+    const assetIdPubkey = new PublicKey(player.stakedAssetId);
     const [stakeRecord] = PublicKey.findProgramAddressSync(
         [Buffer.from("stake_record"), ownerPubkey.toBuffer(), assetIdPubkey.toBuffer()],
         STAKING_PROGRAM_ID
     );
     const stakeRecordAccount = await connection.getAccountInfo(stakeRecord);
     if (!stakeRecordAccount) {
-        console.log(`[Capbot] 🧠 ${uid.slice(0,6)}../${assetId.slice(0,6)}.. no on-chain stake record (unstaked?)`);
+        console.log(`[Capbot] 🧠 ${uid.slice(0,6)}.. no on-chain stake record (unstaked?)`);
         return;
     }
+    // Read authoritative tier + brain_steps from on-chain StakeRecord (Firestore can lag)
+    // Layout: tier at offset 72 (u8), brain_steps at offset 73 (u32 LE)
     const onChainTier = stakeRecordAccount.data[72];
     const currentBrainSteps = stakeRecordAccount.data.readUInt32LE(73);
 
+    // If Firestore tier diverges from on-chain, log + skip — let discovery cron resync
     if (onChainTier !== tier) {
-        console.warn(`[Capbot] 🧠 ${uid.slice(0,6)}../${assetId.slice(0,6)}.. tier mismatch (chain=${onChainTier}, stake=${tier}) — skipping upgrade`);
+        console.warn(`[Capbot] 🧠 ${uid.slice(0,6)}.. tier mismatch (chain=${onChainTier}, firestore=${tier}) — skipping upgrade`);
         return;
     }
     const ceiling = TIER_CEILINGS[tier];
     if (currentBrainSteps >= ceiling) {
-        console.log(`[Capbot] 🧠 ${uid.slice(0,6)}../${assetId.slice(0,6)}.. brain at ceiling (${currentBrainSteps})`);
+        console.log(`[Capbot] 🧠 ${uid.slice(0,6)}.. brain at ceiling (${currentBrainSteps})`);
         return;
     }
 
     const tierFloor = TIER_FLOORS[tier];
     let newBrainSteps = Math.min(currentBrainSteps + CONFIG.BRAIN_STEPS_PER_UPGRADE, ceiling);
+    // On-chain bug workaround: stake instruction initializes brain_steps to 0 regardless
+    // of tier. For tier 1+ stakes, jump to the tier floor first to satisfy the range check.
     if (newBrainSteps < tierFloor) newBrainSteps = tierFloor;
     if (newBrainSteps <= currentBrainSteps) return;
 
+    // === PROOF-OF-BURN: deduct half the winnings to fund the brain upgrade ===
+    // The Ed25519 attestation only fires after the player has paid for it.
+    // Burn currency is the starter coin matching the staked Capbot's type.
     const capbotType = CONFIG.TIER_TYPES[tier];
     const balanceField = `${capbotType.toLowerCase()}Coins`;
     const currentBalance = player[balanceField] ?? 0;
     const burnCost = Math.floor((winnings || 0) * CONFIG.BRAIN_UPGRADE_BURN_PCT);
 
-    if (burnCost <= 0) { console.log(`[Capbot] 🧠 ${uid.slice(0,6)}../${assetId.slice(0,6)}.. upgrade skipped — zero burn cost`); return; }
-    if (currentBalance < burnCost) { console.log(`[Capbot] 🧠 ${uid.slice(0,6)}../${assetId.slice(0,6)}.. upgrade skipped — insufficient ${capbotType} (have ${currentBalance}, need ${burnCost})`); return; }
+    if (burnCost <= 0) {
+        console.log(`[Capbot] 🧠 ${uid.slice(0,6)}.. upgrade skipped — zero burn cost`);
+        return;
+    }
+    if (currentBalance < burnCost) {
+        console.log(`[Capbot] 🧠 ${uid.slice(0,6)}.. upgrade skipped — insufficient ${capbotType} (have ${currentBalance}, need ${burnCost})`);
+        return;
+    }
 
     const timestamp = BigInt(Date.now());
+
+    // Build message: PREFIX || asset_id (32) || new_brain_steps (u32 LE) || timestamp (i64 LE)
     const newBrainStepsBuf = Buffer.alloc(4);
     newBrainStepsBuf.writeUInt32LE(newBrainSteps, 0);
     const timestampBuf = Buffer.alloc(8);
     timestampBuf.writeBigInt64LE(timestamp, 0);
 
     const messageBuffer = Buffer.concat([
-        MESSAGE_PREFIX, assetIdPubkey.toBuffer(), newBrainStepsBuf, timestampBuf,
+        MESSAGE_PREFIX,
+        assetIdPubkey.toBuffer(),
+        newBrainStepsBuf,
+        timestampBuf,
     ]);
 
     const signature = nacl.sign.detached(messageBuffer, upgradeAuthorityKey.secretKey);
 
+    // === TDX ATTESTATION QUOTE ===
+    // Proof that the Ed25519 signature was produced inside the TEE enclave.
+    // report_data = sha256(messageBuffer) — binds the quote to this specific upgrade.
     let tdxQuote = null;
     if (dstackClient) {
         try {
             const reportData = createHash('sha256').update(messageBuffer).digest();
             const quoteResult = await dstackClient.getQuote(reportData);
             tdxQuote = quoteResult.quote;
-        } catch (err) { console.warn(`[TEE] getQuote failed for ${uid.slice(0,6)}..:`, err.message); }
+        } catch (err) {
+            console.warn(`[TEE] getQuote failed for ${uid.slice(0,6)}..:`, err.message);
+        }
     }
 
     const ed25519Ix = Ed25519Program.createInstructionWithPublicKey({
@@ -220,10 +247,15 @@ async function upgradeBrainOnChain(uid, assetId, tier, winnings, battleId) {
     });
 
     const [programConfig] = PublicKey.findProgramAddressSync(
-        [Buffer.from("program_config")], STAKING_PROGRAM_ID
+        [Buffer.from("program_config")],
+        STAKING_PROGRAM_ID
     );
 
-    const args = Buffer.concat([UPGRADE_BRAIN_V2_DISC, newBrainStepsBuf, timestampBuf]);
+    const args = Buffer.concat([
+        UPGRADE_BRAIN_V2_DISC,
+        newBrainStepsBuf,
+        timestampBuf,
+    ]);
 
     const upgradeIx = new TransactionInstruction({
         programId: STAKING_PROGRAM_ID,
@@ -237,34 +269,40 @@ async function upgradeBrainOnChain(uid, assetId, tier, winnings, battleId) {
         ],
         data: args,
     });
-    console.log(`[DEBUG] ${uid.slice(0,6)}../${assetId.slice(0,6)}.. tier=${tier} onChainTier=${onChainTier} currentBrainSteps=${currentBrainSteps} newBrainSteps=${newBrainSteps} tierFloor=${tierFloor} ceiling=${ceiling}`);
+    console.log(`[DEBUG] ${uid.slice(0,6)}.. tier=${tier} onChainTier=${onChainTier} currentBrainSteps=${currentBrainSteps} newBrainSteps=${newBrainSteps} tierFloor=${tierFloor} ceiling=${ceiling}`);
 
     const tx = new Transaction().add(ed25519Ix).add(upgradeIx);
 
     try {
+        // Send the on-chain attestation FIRST. If this fails, no coins burned.
         const sig = await sendAndConfirmTransaction(connection, tx, [upgradeAuthorityKey]);
         const attestedTag = tdxQuote ? ' (TEE-attested)' : '';
-        console.log(`[Capbot] 🧠 ${uid.slice(0,6)}../${assetId.slice(0,6)}.. brain ${currentBrainSteps} -> ${newBrainSteps} (burned ${burnCost} ${capbotType})${attestedTag} | tx: ${sig.slice(0,16)}..`);
+        console.log(`[Capbot] 🧠 ${uid.slice(0,6)}.. brain ${currentBrainSteps} -> ${newBrainSteps} (burned ${burnCost} ${capbotType})${attestedTag} | tx: ${sig.slice(0,16)}..`);
 
-        const stakeRef = db.collection('players').doc(uid).collection('stakes').doc(assetId);
-        await db.runTransaction(async (txn) => {
-            txn.update(stakeRef, { brainSteps: newBrainSteps });
-            txn.update(db.collection('players').doc(uid), {
-                [balanceField]: admin.firestore.FieldValue.increment(-burnCost),
-            });
+        // Then atomically: bump on-chain brain_steps mirror + deduct burn cost
+        await db.collection('players').doc(uid).update({
+            stakedBrainSteps: newBrainSteps,
+            [balanceField]: admin.firestore.FieldValue.increment(-burnCost),
         });
 
+        // Record the burn alongside the upgrade for /proof + Unity My Capbots tab
         await db.collection('brain_upgrades').add({
-            uid, walletAddress: player.solanaWalletAddress,
-            stakedAssetId: assetId,
-            oldBrainSteps: currentBrainSteps, newBrainSteps, tier,
-            txSignature: sig, timestamp: Date.now(),
-            coinsBurned: burnCost, burnCurrency: capbotType,
+            uid,
+            walletAddress: player.solanaWalletAddress,
+            stakedAssetId: player.stakedAssetId,
+            oldBrainSteps: currentBrainSteps,
+            newBrainSteps,
+            tier,
+            txSignature: sig,
+            timestamp: Date.now(),
+            coinsBurned: burnCost,
+            burnCurrency: capbotType,
             battleId: battleId || null,
-            tdxQuote, teeAttested: tdxQuote !== null,
+            tdxQuote,
+            teeAttested: tdxQuote !== null,
         });
     } catch (err) {
-        console.warn(`[Capbot] 🧠 brain upgrade failed for ${uid.slice(0,6)}../${assetId.slice(0,6)}..:`, err.message);
+        console.warn(`[Capbot] 🧠 brain upgrade failed for ${uid.slice(0,6)}..:`, err.message);
     }
 }
 
@@ -281,8 +319,8 @@ async function discoverOnChainStakers() {
             filters: [{ dataSize: STAKE_RECORD_SIZE }],
         });
 
-        // owner → Array<{assetId, tier, brainSteps}>
-        const stakesByOwner = new Map();
+        // Build map: owner pubkey → highest-tier stake
+        const onChainStakers = new Map();
         for (const acct of accounts) {
             const data = acct.account.data;
             if (data.length < STAKE_RECORD_SIZE) continue;
@@ -290,38 +328,40 @@ async function discoverOnChainStakers() {
             const assetId = new PublicKey(data.slice(STAKE_ASSET_OFFSET, STAKE_ASSET_OFFSET + 32)).toBase58();
             const tier = data[STAKE_TIER_OFFSET];
             const brainSteps = data.readUInt32LE(STAKE_BRAIN_STEPS_OFFSET);
-            if (!stakesByOwner.has(owner)) stakesByOwner.set(owner, []);
-            stakesByOwner.get(owner).push({ assetId, tier, brainSteps });
+            const existing = onChainStakers.get(owner);
+            if (!existing || tier > existing.tier) {
+                onChainStakers.set(owner, { assetId, tier, brainSteps });
+            }
         }
 
-        let registered = 0, updated = 0, cleared = 0;
-        let addedStakes = 0, updatedStakes = 0, removedStakes = 0;
+        let registered = 0;
+        let updated = 0;
+        let cleared = 0;
 
-        for (const [owner, stakes] of stakesByOwner) {
-            const top = stakes.reduce((a, b) => (b.tier > a.tier ? b : a));
+        // Forward sync: ensure each on-chain staker has a matching Firestore doc
+        for (const [owner, stake] of onChainStakers) {
             const querySnap = await db.collection('players')
                 .where('solanaWalletAddress', '==', owner)
                 .limit(1)
                 .get();
 
-            let playerRef;
             if (!querySnap.empty) {
+                // Existing doc (Twitter-linked or wallet-signed-in) — update if stake state diverges
                 const doc = querySnap.docs[0];
-                playerRef = doc.ref;
                 const existing = doc.data();
-                if (existing.stakedTier !== top.tier ||
-                    existing.stakedAssetId !== top.assetId ||
-                    existing.stakedBrainSteps !== top.brainSteps) {
-                    await playerRef.update({
-                        stakedTier: top.tier,
-                        stakedAssetId: top.assetId,
-                        stakedBrainSteps: top.brainSteps,
+                if (existing.stakedTier !== stake.tier ||
+                    existing.stakedAssetId !== stake.assetId ||
+                    existing.stakedBrainSteps !== stake.brainSteps) {
+                    await doc.ref.update({
+                        stakedTier: stake.tier,
+                        stakedAssetId: stake.assetId,
+                        stakedBrainSteps: stake.brainSteps,
                     });
                     updated++;
                 }
             } else {
-                playerRef = db.collection('players').doc(owner);
-                await playerRef.set({
+                // Wallet staked but never auth'd — create a wallet-derived player doc
+                await db.collection('players').doc(owner).set({
                     playerId: owner,
                     displayName: `Wallet ${owner.slice(0, 4)}..${owner.slice(-4)}`,
                     isGuest: false,
@@ -336,51 +376,19 @@ async function discoverOnChainStakers() {
                     rank: 0,
                     createdAt: Date.now(),
                     solanaWalletAddress: owner,
-                    stakedTier: top.tier,
-                    stakedBrainSteps: top.brainSteps,
-                    stakedAssetId: top.assetId,
+                    stakedTier: stake.tier,
+                    stakedBrainSteps: stake.brainSteps,
+                    stakedAssetId: stake.assetId,
                     walletLinkedAt: Date.now(),
                     authMethod: 'discovery',
                     discoveredAt: Date.now(),
                 });
-                console.log(`[discovery] 🎯 Registered new staker ${owner.slice(0,8)}.. (${stakes.length} stake${stakes.length>1?'s':''}, top tier=${top.tier})`);
+                console.log(`[discovery] 🎯 Registered new staker ${owner.slice(0,8)}.. tier=${stake.tier} steps=${stake.brainSteps}`);
                 registered++;
-            }
-
-            // Sync subcollection: add new, update changed, delete unstaked
-            const stakesCol = playerRef.collection('stakes');
-            const existingSnap = await stakesCol.get();
-            const existingMap = new Map();
-            existingSnap.forEach(d => existingMap.set(d.id, d.data()));
-            const onChainIds = new Set(stakes.map(s => s.assetId));
-
-            for (const s of stakes) {
-                const existing = existingMap.get(s.assetId);
-                if (!existing) {
-                    await stakesCol.doc(s.assetId).set({
-                        assetId: s.assetId,
-                        tier: s.tier,
-                        brainSteps: s.brainSteps,
-                        lastBattleAt: 0,
-                    });
-                    addedStakes++;
-                } else if (existing.tier !== s.tier || existing.brainSteps !== s.brainSteps) {
-                    await stakesCol.doc(s.assetId).update({
-                        tier: s.tier,
-                        brainSteps: s.brainSteps,
-                    });
-                    updatedStakes++;
-                }
-            }
-            for (const [id] of existingMap) {
-                if (!onChainIds.has(id)) {
-                    await stakesCol.doc(id).delete();
-                    removedStakes++;
-                }
             }
         }
 
-        // Cleanup: players marked staked in Firestore but no on-chain records
+        // Cleanup: detect unstakes (player doc says staked, but no on-chain record)
         const stakerSnap = await db.collection('players')
             .where('stakedTier', '>=', 0)
             .get();
@@ -389,10 +397,7 @@ async function discoverOnChainStakers() {
             const data = doc.data();
             const wallet = data.solanaWalletAddress;
             if (!wallet) continue;
-            if (!stakesByOwner.has(wallet)) {
-                const stakesCol = doc.ref.collection('stakes');
-                const stakesSnap = await stakesCol.get();
-                for (const s of stakesSnap.docs) await s.ref.delete();
+            if (!onChainStakers.has(wallet)) {
                 await doc.ref.update({
                     stakedTier: -1,
                     stakedBrainSteps: 0,
@@ -403,7 +408,7 @@ async function discoverOnChainStakers() {
             }
         }
 
-        console.log(`[discovery] ${stakesByOwner.size} owners | players: reg=${registered} upd=${updated} clr=${cleared} | stakes: +${addedStakes} ~${updatedStakes} -${removedStakes} | ${Date.now() - start}ms`);
+        console.log(`[discovery] ${onChainStakers.size} on-chain stakers | registered=${registered} updated=${updated} cleared=${cleared} | ${Date.now() - start}ms`);
     } catch (err) {
         console.error('[discovery] error:', err);
     }
@@ -412,15 +417,13 @@ async function discoverOnChainStakers() {
 // ============================================================
 // SINGLE-BATTLE RESOLVER (existing Phase 2 logic, unchanged)
 // ============================================================
-async function runBattleForStake(playerDoc, stakeDoc) {
+async function runBattleForPlayer(playerDoc) {
     const uid = playerDoc.id;
     const player = playerDoc.data();
-    const stake = stakeDoc.data();
-    const stakedTier = stake.tier;
-    const assetId = stake.assetId;
+    const stakedTier = player.stakedTier;
 
     if (stakedTier < 0 || stakedTier >= CONFIG.TIER_TYPES.length) {
-        console.log(`[Capbot] Skipping ${uid}/${assetId.slice(0,6)} — invalid tier ${stakedTier}`);
+        console.log(`[Capbot] Skipping ${uid} — invalid tier ${stakedTier}`);
         return;
     }
 
@@ -439,9 +442,8 @@ async function runBattleForStake(playerDoc, stakeDoc) {
     }
     const winnings = Math.floor(CONFIG.BASE_BET * multiplier);
 
-    const idempotencyKey = `capbot_${uid}_${assetId.slice(0,8)}_${Date.now()}_${randomUUID().slice(0, 8)}`;
+    const idempotencyKey = `capbot_${uid}_${Date.now()}_${randomUUID().slice(0, 8)}`;
     const playerRef = db.collection('players').doc(uid);
-    const stakeRef = stakeDoc.ref;
     const idempRef = db.collection('battle_idempotency_keys').doc(idempotencyKey);
     const activityRef = db.collection('capbot_activity').doc();
 
@@ -473,8 +475,12 @@ async function runBattleForStake(playerDoc, stakeDoc) {
 
             const newBalance = Math.max(currentBalance + playerDelta, 0);
             const newAiPool = Math.min(Math.max(currentAiPool + aiDelta, 0), CONFIG.AI_POOL_MAX_CAP);
-            const newTotalWon = playerWon ? (data.totalWon ?? 0) + winnings : (data.totalWon ?? 0);
+
+            const newTotalWon = playerWon
+                ? (data.totalWon ?? 0) + winnings
+                : (data.totalWon ?? 0);
             const newRank = computeRankFromTotalWon(newTotalWon);
+
             const now = Date.now();
 
             tx.update(playerRef, {
@@ -486,8 +492,6 @@ async function runBattleForStake(playerDoc, stakeDoc) {
                 lastUpdated: now,
             });
 
-            tx.update(stakeRef, { lastBattleAt: now });
-
             tx.set(idempRef, {
                 uid, source: 'capbot', createdAt: now,
                 expiresAt: now + (24 * 60 * 60 * 1000),
@@ -497,7 +501,7 @@ async function runBattleForStake(playerDoc, stakeDoc) {
                 battleId: activityRef.id,
                 uid,
                 walletAddress: data.solanaWalletAddress ?? null,
-                stakedAssetId: assetId,
+                stakedAssetId: data.stakedAssetId ?? null,
                 stakedTier, capbotType, defeatedAi: aiType,
                 betAmount: CONFIG.BASE_BET,
                 multiplier, payout: playerDelta, playerWon,
@@ -506,8 +510,9 @@ async function runBattleForStake(playerDoc, stakeDoc) {
         });
 
         console.log(
-            `[Capbot] ${uid.slice(0,6)}../${assetId.slice(0,6)}.. tier=${stakedTier} (${capbotType}) ` +
-            `vs ${aiType} → ${playerWon ? '+' : ''}${playerWon ? winnings : -CONFIG.BASE_BET} (${multiplier}×)`
+            `[Capbot] ${uid.slice(0,6)}.. tier=${stakedTier} (${capbotType}) ` +
+            `vs ${aiType} → ${playerWon ? '+' : ''}${playerWon ? winnings : -CONFIG.BASE_BET} ` +
+            `(${multiplier}×)`
         );
 
         try {
@@ -515,7 +520,6 @@ async function runBattleForStake(playerDoc, stakeDoc) {
                 battleId: activityRef.id,
                 uid,
                 walletAddress: player.solanaWalletAddress ?? null,
-                stakedAssetId: assetId,
                 capbotName: capbotType,
                 capbotTier: stakedTier,
                 opponentName: aiType,
@@ -528,12 +532,13 @@ async function runBattleForStake(playerDoc, stakeDoc) {
         } catch (err) {
             console.warn(`[Capbot] failed to save replay for ${uid.slice(0,6)}..:`, err.message);
         }
-
+        // Pattern 2: brain upgrades only fire on wins, with proof-of-burn deduction.
+        // Pass activityRef.id for cross-doc linkage (brain_upgrades -> battle_replays).
         if (playerWon) {
-            await upgradeBrainOnChain(uid, assetId, stakedTier, winnings, activityRef.id);
+            await upgradeBrainOnChain(uid, winnings, activityRef.id);
         }
     } catch (err) {
-        console.warn(`[Capbot] battle failed for ${uid.slice(0,6)}../${assetId.slice(0,6)}..: ${err.message}`);
+        console.warn(`[Capbot] battle failed for ${uid.slice(0,6)}..: ${err.message}`);
     }
 }
 
@@ -543,29 +548,14 @@ async function runBattleForStake(playerDoc, stakeDoc) {
 async function tick() {
     const start = Date.now();
     try {
-        const stakeSnap = await db.collectionGroup('stakes').get();
-        if (stakeSnap.size === 0) {
-            console.log('[Capbot] tick — no stakes');
+        const snap = await db.collection('players').where('stakedTier', '>=', 0).get();
+        if (snap.size === 0) {
+            console.log('[Capbot] tick — no stakers');
             return;
         }
-
-        const stakesByPlayer = new Map();
-        for (const stakeDoc of stakeSnap.docs) {
-            const playerRef = stakeDoc.ref.parent.parent;
-            if (!playerRef) continue;
-            const key = playerRef.path;
-            if (!stakesByPlayer.has(key)) stakesByPlayer.set(key, { playerRef, stakeDocs: [] });
-            stakesByPlayer.get(key).stakeDocs.push(stakeDoc);
-        }
-
-        console.log(`[Capbot] tick — ${stakeSnap.size} stakes across ${stakesByPlayer.size} owners`);
-
-        for (const { playerRef, stakeDocs } of stakesByPlayer.values()) {
-            const playerDoc = await playerRef.get();
-            if (!playerDoc.exists) continue;
-            for (const stakeDoc of stakeDocs) {
-                await runBattleForStake(playerDoc, stakeDoc);
-            }
+        console.log(`[Capbot] tick — ${snap.size} active stakers`);
+        for (const doc of snap.docs) {
+            await runBattleForPlayer(doc);
         }
         console.log(`[Capbot] tick complete in ${Date.now() - start}ms`);
     } catch (err) {
